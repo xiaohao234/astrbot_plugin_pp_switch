@@ -1,0 +1,56 @@
+{
+  "trigger_words": {
+    "type": "list",
+    "description": "触发词列表（无需@机器人）。消息完全等于触发词、或为「触发词 + 空格 + 序号」时生效。修改后需重启插件。",
+    "default": ["pp", "人格切换"]
+  },
+  "admin_only": {
+    "type": "bool",
+    "description": "仅管理员可切换人格（查看列表不受此限制）",
+    "default": false
+  },
+  "intro_max_len": {
+    "type": "int",
+    "description": "图片中每个人格介绍的最大字符数（介绍取自人格提示词的第一条有效内容）",
+    "default": 60
+  },
+  "image_width": {
+    "type": "int",
+    "description": "人格列表图片的宽度（像素，高度自适应）",
+    "default": 900
+  },
+  "image_scale": {
+    "type": "int",
+    "description": "图片超采样倍数（1~3，越大越清晰、生成越慢）",
+    "default": 2
+  },
+  "font_path": {
+    "type": "string",
+    "description": "自定义中文字体文件路径（留空则自动探测系统字体；服务器建议安装 fonts-noto-cjk）",
+    "default": ""
+  },
+  "show_current": {
+    "type": "bool",
+    "description": "在列表图片中标记当前会话正在使用的人格",
+    "default": true
+  },
+  "help_lines": {
+    "type": "list",
+    "description": "图片底部的帮助说明（每条一行；留空则使用默认文案）",
+    "default": [
+      "发送 pp <序号> 切换到对应人格，例如：pp 2",
+      "发送 pp 或 pp 列表 查看人格列表",
+      "发送 pp 当前 查看当前人格"
+    ]
+  },
+  "switch_handoff": {
+    "type": "bool",
+    "description": "切换时在会话记忆末尾写入一条轻量「切换标记」，让新人格立即接管语气、避免旧人格残留（不会删除任何历史记忆）",
+    "default": true
+  },
+  "switch_clear_history": {
+    "type": "bool",
+    "description": "切换时同时清空当前会话的聊天记忆（会丢失记忆，一般不建议开启）",
+    "default": false
+  }
+}
