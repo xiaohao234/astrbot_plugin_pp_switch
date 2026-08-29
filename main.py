@@ -803,6 +803,9 @@ class PPSwitchPlugin(Star):
                     platform_name=platform_name,
                     provider_settings=provider_settings,
                 )
+                # "[%None]" 是“强制无人格”的内部哨兵值，对外统一显示为未设置
+                if pid == "[%None]":
+                    return None
                 return pid
             except Exception:
                 pass
