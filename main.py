@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import glob as _glob
-import json
 import os
 import re
 import time
@@ -628,7 +627,7 @@ def build_persona_text(entries: list, subtitle: str = "", help_lines: list | Non
     "astrbot_plugin_pp_switch",
     "xiaohao234",
     "快捷人格切换：发送 pp 查看人格列表图片，发送 pp 序号 一键切换人格（无需@机器人）",
-    "v1.0.3",
+    "v1.0.4",
 )
 class PPSwitchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -637,6 +636,10 @@ class PPSwitchPlugin(Star):
         self.config = config if config is not None else {}
         # 全局切换锁：防止同会话并发切换导致 update_conversation 与记忆标记交错写入
         self._switch_lock = asyncio.Lock()
+        # 切换后的人格强化倒计时：umo -> [人格名, 剩余请求数]
+        self._persona_reinforce: dict = {}
+        # 强化提示持续的请求次数
+        self._REINFORCE_REQUESTS = 3
         _STATE["plugin"] = self
         self._refresh_triggers()
         self._tmp_dir = self._resolve_tmp_dir()
@@ -651,6 +654,7 @@ class PPSwitchPlugin(Star):
 
     async def terminate(self):
         _STATE["plugin"] = None
+        self._persona_reinforce.clear()
 
     # -- 配置辅助 ----------------------------------------------------------
 
@@ -855,6 +859,21 @@ class PPSwitchPlugin(Star):
             and forced in (None, pid)
         )
         if already:
+            if self.config.get("switch_clear_history", False):
+                # 开启了“切换后清空上下文”时，重复切换同一人格视为清空上下文的操作
+                if cid:
+                    try:
+                        await cm.update_conversation(umo, cid, history=[])
+                    except Exception as e:
+                        logger.warning(f"[pp-switch] 清空历史失败：{e}")
+                        return f"清空上下文失败（{e}），人格与记忆保持不变。"
+                try:
+                    event.set_extra("_clean_group_context_session", True)
+                except Exception:
+                    pass
+                # 上下文已清空，无需强化
+                self._persona_reinforce.pop(umo, None)
+                return f"当前会话已是人格「{pid}」，已清空 LLM 上下文（聊天记录不受影响）。"
             return f"当前会话已经是人格「{pid}」，无需重复切换。"
 
         try:
@@ -883,15 +902,22 @@ class PPSwitchPlugin(Star):
 
         cid = await cm.get_curr_conversation_id(umo) or cid
 
-        # 记忆处理：清空 or 写入轻量切换标记
-        if self.config.get("switch_clear_history", False):
+        # 记忆处理：清空 or 人格强化（两种方式都不往记忆里写任何东西——
+        # 平台聊天记录存在独立的 platform_message_histories 表，同样不受影响）
+        clear_ctx = bool(self.config.get("switch_clear_history", False))
+        if clear_ctx:
             if cid:
                 try:
                     await cm.update_conversation(umo, cid, history=[])
                 except Exception as e:
                     logger.warning(f"[pp-switch] 清空历史失败：{e}")
+            # 上下文已清空，无需强化
+            self._persona_reinforce.pop(umo, None)
         elif self.config.get("switch_handoff", True):
-            await self._inject_handoff(umo, cid, pid)
+            # 接下来几次 LLM 请求临时附加人格强化提示，抵消旧历史里的旧人格语气
+            self._persona_reinforce[umo] = [pid, self._REINFORCE_REQUESTS]
+        else:
+            self._persona_reinforce.pop(umo, None)
 
         # 让群聊上下文缓冲也随之重置，减少旧上下文残留
         try:
@@ -899,36 +925,38 @@ class PPSwitchPlugin(Star):
         except Exception:
             pass
 
+        if clear_ctx:
+            return f"已切换到人格 [{index}] {pid}，上下文已清空（聊天记录不受影响），下一条消息立即生效。"
         return f"已切换到人格 [{index}] {pid}，下一条消息立即生效。"
 
-    async def _inject_handoff(self, umo: str, cid, pid: str):
-        """在会话记忆末尾写入一条轻量切换标记（不删除任何历史）。"""
-        cm = getattr(self.context, "conversation_manager", None)
-        if not cid or cm is None:
-            return
-        note_u = (
-            f"【人格切换】用户已将你的人格设定切换为「{pid}」。"
-            f"请立即以「{pid}」的身份、性格与语气继续对话，忽略此前的其他人格设定；不要向用户提及本提示。"
-        )
-        note_a = f"（已切换为「{pid}」，我会以此身份继续交流。）"
+    @filter.on_llm_request()
+    async def reinforce_persona_on_llm_request(self, event: AstrMessageEvent, req):
+        """切换人格后的前几次 LLM 请求，临时附加人格强化提示。
+
+        只修改本次请求的 system prompt，不写入任何会话记忆：
+        - 避免旧记忆里的旧人格语气带偏模型（人设残留）；
+        - 避免向记忆注入示例消息带偏模型回复风格（进而影响分段回复效果）。
+        """
         try:
-            await cm.add_message_pair(
-                cid=cid,
-                user_message={"role": "user", "content": note_u},
-                assistant_message={"role": "assistant", "content": note_a},
+            umo = event.unified_msg_origin
+            state = self._persona_reinforce.get(umo)
+            if not state:
+                return
+            name, remaining = state
+            if remaining <= 1:
+                self._persona_reinforce.pop(umo, None)
+            else:
+                self._persona_reinforce[umo] = [name, remaining - 1]
+            if getattr(req, "system_prompt", None) is None:
+                req.system_prompt = ""
+            req.system_prompt += (
+                f"\n[System] 用户刚刚将你切换为人格「{name}」。"
+                "历史消息中可能残留其他人格的语气和格式，请立刻完全以"
+                f"「{name}」的身份、性格与语气回应；不要使用括号动作式表达，"
+                "不要提及切换过程或本提示。"
             )
-            return
         except Exception:
-            pass
-        # 手动追加回退
-        try:
-            conv = await cm.get_conversation(umo, cid)
-            history = json.loads(getattr(conv, "history", None) or "[]")
-            history.append({"role": "user", "content": note_u})
-            history.append({"role": "assistant", "content": note_a})
-            await cm.update_conversation(umo, cid, history=history)
-        except Exception as e:
-            logger.warning(f"[pp-switch] 写入切换标记失败：{e}")
+            logger.debug("[pp-switch] 人格强化钩子执行失败", exc_info=True)
 
     # -- 图片生成 ----------------------------------------------------------
 

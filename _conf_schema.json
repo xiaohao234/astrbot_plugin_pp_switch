@@ -45,12 +45,12 @@
   },
   "switch_handoff": {
     "type": "bool",
-    "description": "切换时在会话记忆末尾写入一条轻量「切换标记」，让新人格立即接管语气、避免旧人格残留（不会删除任何历史记忆）",
+    "description": "切换后在接下来的几次 LLM 请求中临时附加人格强化提示，抵消旧记忆里的旧人格语气、避免人设残留（只影响请求，不写入、不修改任何聊天记忆）",
     "default": true
   },
   "switch_clear_history": {
     "type": "bool",
-    "description": "切换时同时清空当前会话的聊天记忆（会丢失记忆，一般不建议开启）",
+    "description": "切换人格后清空当前会话的 LLM 上下文（对话记忆从头开始）。只清对话记忆，不会删除聊天记录——WebUI 的聊天记录仍可查看（保留条数由 AstrBot 配置 provider_ltm_settings.group_message_history_max_cnt 决定，默认 700，可自行改为 200）",
     "default": false
   }
 }
