@@ -63,6 +63,7 @@ DEFAULT_HELP_LINES = [
     "发送 pp <序号> 切换到对应人格，例如：pp 2",
     "发送 pp 或 pp 列表 查看人格列表",
     "发送 pp 当前 查看当前人格",
+    "发送 pp 复位 切回底层人格（如已配置）",
 ]
 
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_\-@#%/.+]+|\s+|.")
@@ -143,7 +144,11 @@ _C = {
 }
 
 # 插件级共享状态（CustomFilter 在类实例创建前即被实例化，通过它读取触发词）
-_STATE: dict = {"plugin": None, "trigger_words": list(DEFAULT_TRIGGERS)}
+_STATE: dict = {
+    "plugin": None,
+    "trigger_words": list(DEFAULT_TRIGGERS),
+    "require_at": False,
+}
 
 # 字体缓存
 _FONT_FILE_CACHE: str | None = None
@@ -207,6 +212,8 @@ def parse_trigger(text: str, words) -> tuple | None:
                 return ("help", None)
             if rest in ("当前", "now", "cur"):
                 return ("current", None)
+            if rest in ("复位", "reset", "取消"):
+                return ("reset", None)
             return ("invalid", rest)
     return None
 
@@ -229,6 +236,14 @@ class PPTriggerFilter(CustomFilter):
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         try:
+            # require_at 模式：群聊必须被 @ / 唤醒前缀 / 引用唤醒（防多 bot 同时误触发）；
+            # 私聊与 webchat 无需 @。waking_check 在运行 handler filter 前已完成唤醒检测，
+            # 因此此处 is_at_or_wake_command 已就绪。
+            if _STATE.get("require_at") and not event.is_private_chat():
+                if event.get_platform_name() != "webchat" and not getattr(
+                    event, "is_at_or_wake_command", False
+                ):
+                    return False
             words = _STATE.get("trigger_words") or list(DEFAULT_TRIGGERS)
             return parse_trigger(getattr(event, "message_str", ""), words) is not None
         except Exception:
@@ -627,7 +642,7 @@ def build_persona_text(entries: list, subtitle: str = "", help_lines: list | Non
     "astrbot_plugin_pp_switch",
     "xiaohao234",
     "快捷人格切换：发送 pp 查看人格列表图片，发送 pp 序号 一键切换人格（无需@机器人）",
-    "v1.0.4",
+    "v1.0.5",
 )
 class PPSwitchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -664,6 +679,12 @@ class PPSwitchPlugin(Star):
 
     def _refresh_triggers(self):
         _STATE["trigger_words"] = _norm_words(self.config.get("trigger_words"))
+        _STATE["require_at"] = bool(self.config.get("require_at", False))
+
+    @property
+    def base_persona(self) -> str:
+        """底层人格名称（空 = 未启用）。需先在 AstrBot「人格角色设定」中创建。"""
+        return self._cfg_str("base_persona")
 
     def _cfg_str(self, key: str) -> str:
         return str(self.config.get(key) or "").strip()
@@ -717,6 +738,7 @@ class PPSwitchPlugin(Star):
 
         优先读 ``persona_manager.personas``（v4 的 Persona 对象，含 sort_order，
         可对齐 WebUI 的拖拽排序），其次回退 ``personas_v3``。返回顺序即列表序号顺序。
+        配置了 ``base_persona``（底层人格）时，该人格会从列表中隐藏、不参与编号。
         """
         pm = getattr(self.context, "persona_manager", None)
         if pm is None:
@@ -732,11 +754,12 @@ class PPSwitchPlugin(Star):
             sort_order = getattr(p, "sort_order", 0)
             return name, prompt, sort_order
 
+        base = self.base_persona
         # 优先对象列表：含 sort_order，稳定排序后与 WebUI 显示顺序一致
         items = []
         for p in getattr(pm, "personas", None) or []:
             name, prompt, so = _to_dict(p)
-            if not name:
+            if not name or (base and name == base):
                 continue
             try:
                 so = int(so or 0)
@@ -752,9 +775,26 @@ class PPSwitchPlugin(Star):
         out = []
         for p in getattr(pm, "personas_v3", None) or []:
             name, prompt, _ = _to_dict(p)
-            if name:
+            if name and not (base and name == base):
                 out.append({"name": name, "prompt": prompt or ""})
         return out
+
+    def _get_all_persona_names(self) -> list:
+        """获取全部人格名（含被隐藏的底层人格），用于校验 pp 复位目标是否存在。"""
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is None:
+            return []
+        names = []
+        for p in getattr(pm, "personas", None) or []:
+            n = getattr(p, "persona_id", None) or getattr(p, "name", None)
+            if n:
+                names.append(n)
+        if not names:
+            for p in getattr(pm, "personas_v3", None) or []:
+                n = p.get("name") if hasattr(p, "get") else getattr(p, "persona_id", None)
+                if n:
+                    names.append(n)
+        return names
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         try:
@@ -829,19 +869,35 @@ class PPSwitchPlugin(Star):
 
     async def _switch_persona(self, event: AstrMessageEvent, index: int) -> str:
         async with self._switch_lock:
-            return await self._switch_persona_locked(event, index)
+            return await self._switch_persona_locked(event, index=index)
 
-    async def _switch_persona_locked(self, event: AstrMessageEvent, index: int) -> str:
+    async def _switch_to_base(self, event: AstrMessageEvent) -> str:
+        """pp 复位：切回插件 WebUI 配置的底层人格（解除角色设定）。"""
+        base = self.base_persona
+        if not base:
+            return "未配置底层人格：请先在 AstrBot 创建占位人格，再到本插件 WebUI 填写其名称。"
+        if base not in self._get_all_persona_names():
+            return f"底层人格「{base}」不存在，请检查 AstrBot 人格列表与插件配置是否一致。"
+        async with self._switch_lock:
+            return await self._switch_persona_locked(event, pid_override=base)
+
+    async def _switch_persona_locked(
+        self, event: AstrMessageEvent, index: int | None = None, pid_override: str | None = None
+    ) -> str:
         umo = event.unified_msg_origin
-        personas = self._get_personas()
-        if not personas:
-            return "未找到任何人格，请先在 WebUI「人格角色设定」中创建人格。"
+        is_reset = pid_override is not None
+        if is_reset:
+            pid = pid_override
+        else:
+            personas = self._get_personas()
+            if not personas:
+                return "未找到任何人格，请先在 WebUI「人格角色设定」中创建人格。"
 
-        if index < 1 or index > len(personas):
-            return f"序号超出范围（1-{len(personas)}），发送 pp 查看人格列表。"
+            if index < 1 or index > len(personas):
+                return f"序号超出范围（1-{len(personas)}），发送 pp 查看人格列表。"
 
-        persona = personas[index - 1]
-        pid = persona.get("name")
+            persona = personas[index - 1]
+            pid = persona.get("name")
 
         if self.config.get("admin_only", False) and not self._is_admin(event):
             return "仅管理员可切换人格（可在本插件 WebUI 配置中关闭此限制）。"
@@ -876,8 +932,16 @@ class PPSwitchPlugin(Star):
                     pass
                 # 上下文已清空，无需强化
                 self._persona_reinforce.pop(umo, None)
-                return f"当前会话已是人格「{pid}」，已清空 LLM 上下文（聊天记录不受影响）。"
-            return f"当前会话已经是人格「{pid}」，无需重复切换。"
+                return (
+                    f"当前会话已是底层人格「{pid}」，已清空 LLM 上下文（聊天记录不受影响）。"
+                    if is_reset
+                    else f"当前会话已是人格「{pid}」，已清空 LLM 上下文（聊天记录不受影响）。"
+                )
+            return (
+                f"当前会话已是底层人格「{pid}」，无需重复切换。"
+                if is_reset
+                else f"当前会话已经是人格「{pid}」，无需重复切换。"
+            )
 
         try:
             if conv is None:
@@ -916,6 +980,9 @@ class PPSwitchPlugin(Star):
                     logger.warning(f"[pp-switch] 清空历史失败：{e}")
             # 上下文已清空，无需强化
             self._persona_reinforce.pop(umo, None)
+        elif is_reset:
+            # 回到底层（中性）人格，无需人格强化
+            self._persona_reinforce.pop(umo, None)
         elif self.config.get("switch_handoff", True):
             # 接下来几次 LLM 请求临时附加人格强化提示，抵消旧历史里的旧人格语气
             self._persona_reinforce[umo] = [pid, self._REINFORCE_REQUESTS]
@@ -928,6 +995,10 @@ class PPSwitchPlugin(Star):
         except Exception:
             pass
 
+        if is_reset:
+            if clear_ctx:
+                return f"已复位到底层人格「{pid}」，角色设定已解除，上下文已清空（聊天记录不受影响）。"
+            return f"已复位到底层人格「{pid}」，角色设定已解除，下一条消息立即生效。"
         if clear_ctx:
             return f"已切换到人格 [{index}] {pid}，上下文已清空（聊天记录不受影响），下一条消息立即生效。"
         return f"已切换到人格 [{index}] {pid}，下一条消息立即生效。"
@@ -1061,13 +1132,21 @@ class PPSwitchPlugin(Star):
             event.stop_event()
             return
 
+        if kind == "reset":
+            result = await self._switch_to_base(event)
+            yield event.plain_result(result)
+            event.stop_event()
+            return
+
         if kind == "help":
             tips = (
                 "pp 人格切换使用说明\n"
                 "1. pp 或 pp 列表：查看人格列表图片\n"
                 "2. pp <序号>：切换到对应人格，例如 pp 2\n"
                 "3. pp 当前：查看当前会话使用的人格\n"
+                "4. pp 复位：切回底层人格，解除角色设定\n"
                 f"当前触发词：{'、'.join(self.trigger_words)}"
+                + ("（群聊需 @ 机器人触发）" if _STATE.get("require_at") else "")
             )
             yield event.plain_result(tips)
             event.stop_event()

@@ -43,6 +43,16 @@
       "发送 pp 当前 查看当前人格"
     ]
   },
+  "base_persona": {
+    "type": "string",
+    "description": "底层人格名称（选填）：先在 AstrBot「人格角色设定」创建一个占位人格（提示词写「请等待插件注入人格」之类），并把它设为 AstrBot 默认人格，再把名称填到这里。配置后该人格不在 pp 列表中显示、不参与编号；发送 pp 复位 可随时切回它",
+    "default": ""
+  },
+  "require_at": {
+    "type": "bool",
+    "description": "群聊必须 @ 机器人（或使用唤醒前缀/引用唤醒）才能触发 pp，防止多个机器人同时响应同一条消息；私聊与 WebChat 不受影响。触发后由插件直接回复并停止传播，不会把 pp 当作聊天内容发给 LLM",
+    "default": false
+  },
   "switch_handoff": {
     "type": "bool",
     "description": "切换后在接下来的几次 LLM 请求中临时附加人格强化提示，抵消旧记忆里的旧人格语气、避免人设残留（只影响请求，不写入、不修改任何聊天记忆）",
