@@ -214,6 +214,12 @@ def parse_trigger(text: str, words) -> tuple | None:
                 return ("current", None)
             if rest in ("复位", "reset", "取消"):
                 return ("reset", None)
+            m = re.fullmatch(r"隐藏(?:\s+(\d+))?", rest)
+            if m:
+                return ("hide", int(m.group(1)) if m.group(1) else None)
+            m = re.fullmatch(r"(?:显示|show)(?:\s+(\d+))?", rest)
+            if m:
+                return ("show", int(m.group(1)) if m.group(1) else None)
             return ("invalid", rest)
     return None
 
@@ -642,7 +648,7 @@ def build_persona_text(entries: list, subtitle: str = "", help_lines: list | Non
     "astrbot_plugin_pp_switch",
     "xiaohao234",
     "快捷人格切换：发送 pp 查看人格列表图片，发送 pp 序号 一键切换人格（无需@机器人）",
-    "v1.0.5",
+    "v1.0.6",
 )
 class PPSwitchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -685,6 +691,34 @@ class PPSwitchPlugin(Star):
     def base_persona(self) -> str:
         """底层人格名称（空 = 未启用）。需先在 AstrBot「人格角色设定」中创建。"""
         return self._cfg_str("base_persona")
+
+    def _hidden_names(self) -> set:
+        """当前被隐藏（不在列表图片显示）的人格名集合。"""
+        raw = self.config.get("hidden_personas")
+        if isinstance(raw, str):
+            raw = re.split(r"[,\uFF0C\s\n]+", raw)
+        return {str(x).strip() for x in (raw or []) if str(x).strip()}
+
+    def _save_config(self):
+        """运行时修改配置后持久化到插件配置文件。"""
+        try:
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                save()
+        except Exception as e:
+            logger.warning(f"[pp-switch] 配置保存失败：{e}")
+
+    def _is_hide_manager(self, event: AstrMessageEvent) -> bool:
+        """隐藏管理指令权限：仅 WebUI 配置的 QQ 号（不认 AstrBot 管理员，避免歧义）。"""
+        allowed = {
+            str(x).strip()
+            for x in (self.config.get("hide_managers") or [])
+            if str(x).strip()
+        }
+        try:
+            return str(event.get_sender_id()) in allowed
+        except Exception:
+            return False
 
     def _cfg_str(self, key: str) -> str:
         return str(self.config.get(key) or "").strip()
@@ -1048,26 +1082,14 @@ class PPSwitchPlugin(Star):
             umo, conv_pid, event.get_platform_name()
         )
         show_current = bool(self.config.get("show_current", True))
+        entries, subtitle, visible = self._build_entries(
+            cur_pid, show_current
+        )
 
-        entries = []
-        for i, p in enumerate(personas, 1):
-            name = p.get("name") or f"persona-{i}"
-            intro = make_intro(
-                p.get("prompt") or "",
-                self._cfg_int("intro_max_len", 60, 8, 300),
-            )
-            entries.append(
-                {
-                    "index": i,
-                    "name": name,
-                    "intro": intro,
-                    "current": bool(show_current and cur_pid and name == cur_pid),
-                }
-            )
-
-        # 副标题：总数 + 当前人格
-        cur_disp = "未设置（默认）" if not cur_pid else str(cur_pid)
-        subtitle = f"共 {len(personas)} 个人格 · 当前使用：{cur_disp}"
+        if not visible:
+            event.stop_event()
+            yield event.plain_result("当前所有人格都被隐藏了，请让隐藏管理员用 pp 显示 <序号> 恢复。")
+            return
 
         raw_help = self.config.get("help_lines")
         if isinstance(raw_help, str):
@@ -1112,6 +1134,90 @@ class PPSwitchPlugin(Star):
             yield event.plain_result(text)
             event.stop_event()
 
+    def _build_entries(self, cur_pid, show_current: bool):
+        """构建列表条目。
+
+        序号使用“编号列表”（隐藏了 base_persona 之后的全量人格）的稳定序号：
+        被 pp 隐藏 的人格只是不在图片中显示，序号不变、仍可 pp 序号 切换，
+        避免动态重排导致不同用户记忆的序号漂移。
+        """
+        personas = self._get_personas()
+        hidden = self._hidden_names()
+        entries = []
+        hidden_cnt = 0
+        for i, p in enumerate(personas, 1):
+            name = p.get("name") or f"persona-{i}"
+            is_hidden = name in hidden
+            hidden_cnt += 1 if is_hidden else 0
+            entries.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "intro": make_intro(
+                        p.get("prompt") or "",
+                        self._cfg_int("intro_max_len", 60, 8, 300),
+                    ),
+                    "current": bool(show_current and cur_pid and name == cur_pid),
+                    "visible": not is_hidden,
+                }
+            )
+
+        cur_disp = "未设置（默认）" if not cur_pid else str(cur_pid)
+        subtitle = f"共 {len(personas)} 个人格"
+        if hidden_cnt:
+            subtitle += f" · 已隐藏 {hidden_cnt} 个"
+        subtitle += f" · 当前使用：{cur_disp}"
+        return entries, subtitle, any(e.get("visible", True) for e in entries)
+
+    # -- 隐藏管理 ----------------------------------------------------------
+
+    def _handle_hide_show(self, event: AstrMessageEvent, kind: str, arg) -> str:
+        """pp 隐藏 / pp 显示：仅 WebUI 配置的 QQ 号可用。"""
+        if not self._is_hide_manager(event):
+            # 统一话术，不区分“未配置”与“不在名单”，避免泄露配置状态
+            return "你没有权限使用隐藏管理指令。"
+
+        personas = self._get_personas()
+        if not personas:
+            return "未找到任何人格，无法管理隐藏。"
+
+        if arg is None:
+            hidden = self._hidden_names()
+            if not hidden:
+                return "当前没有隐藏的人格。用法：pp 隐藏 <序号>（序号见 pp 列表图片）"
+            lines = ["当前隐藏的人格："]
+            for idx, p in enumerate(personas, 1):
+                if p.get("name") in hidden:
+                    lines.append(f"[{idx}] {p.get('name')}")
+            lines.append("用 pp 显示 <序号> 可取消隐藏")
+            return "\n".join(lines)
+
+        if not (1 <= arg <= len(personas)):
+            return f"序号超出范围（1-{len(personas)}）。"
+
+        name = personas[arg - 1].get("name")
+        if self.base_persona and name == self.base_persona:
+            return "底层人格始终隐藏，无需操作。"
+
+        hidden = self._hidden_names()
+        if kind == "hide":
+            if name in hidden:
+                return f"人格 [{arg}] {name} 已在隐藏列表中。"
+            hidden.add(name)
+            self.config["hidden_personas"] = sorted(hidden)
+            self._save_config()
+            return (
+                f"已隐藏人格 [{arg}] {name}：不再出现在 pp 列表图片中。"
+                "注意：序号保持不变，其他用户仍可通过 pp "
+                f"{arg} 切换到它；如需彻底停用请在 AstrBot 中删除该人格。"
+            )
+        if name not in hidden:
+            return f"人格 [{arg}] {name} 未被隐藏。"
+        hidden.discard(name)
+        self.config["hidden_personas"] = sorted(hidden)
+        self._save_config()
+        return f"已取消隐藏人格 [{arg}] {name}，它将重新出现在 pp 列表图片中。"
+
     # -- 入口 --------------------------------------------------------------
 
     @_pp_handler_decorator
@@ -1138,6 +1244,12 @@ class PPSwitchPlugin(Star):
             event.stop_event()
             return
 
+        if kind in ("hide", "show"):
+            result = self._handle_hide_show(event, kind, arg)
+            yield event.plain_result(result)
+            event.stop_event()
+            return
+
         if kind == "help":
             tips = (
                 "pp 人格切换使用说明\n"
@@ -1145,6 +1257,7 @@ class PPSwitchPlugin(Star):
                 "2. pp <序号>：切换到对应人格，例如 pp 2\n"
                 "3. pp 当前：查看当前会话使用的人格\n"
                 "4. pp 复位：切回底层人格，解除角色设定\n"
+                "5. pp 隐藏/显示 <序号>：管理列表图片中隐藏的人格（仅限隐藏管理员）\n"
                 f"当前触发词：{'、'.join(self.trigger_words)}"
                 + ("（群聊需 @ 机器人触发）" if _STATE.get("require_at") else "")
             )
@@ -1164,8 +1277,10 @@ class PPSwitchPlugin(Star):
             return
 
         if kind == "invalid":
+            # 回显做净化：截断并压平换行，防止被用来构造多行钓鱼内容
+            safe_arg = re.sub(r"\s+", " ", str(arg))[:30]
             yield event.plain_result(
-                f"无法识别的参数「{arg}」。用法：pp 查看列表，pp <序号> 切换人格。"
+                f"无法识别的参数「{safe_arg}」。用法：pp 查看列表，pp <序号> 切换人格。"
             )
             event.stop_event()
             return
