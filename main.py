@@ -26,6 +26,7 @@ import uuid
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -648,7 +649,7 @@ def build_persona_text(entries: list, subtitle: str = "", help_lines: list | Non
     "astrbot_plugin_pp_switch",
     "xiaohao234",
     "快捷人格切换：发送 pp 查看人格列表图片，发送 pp 序号 一键切换人格（无需@机器人）",
-    "v1.0.6",
+    "v1.0.7",
 )
 class PPSwitchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -1065,6 +1066,51 @@ class PPSwitchPlugin(Star):
             )
         except Exception:
             logger.debug("[pp-switch] 人格强化钩子执行失败", exc_info=True)
+
+    @filter.on_decorating_result()
+    async def add_persona_prefix(self, event: AstrMessageEvent):
+        """在 LLM 回复内容前附加当前人格名前缀，如：[音游大神]你好呀。
+
+        OnDecoratingResultEvent 在 ResultDecorateStage 中派发，且位于分段回复
+        处理之前（stage.py 中钩子派发先于分段逻辑，钩子后框架会重新读取
+        result.chain），因此只修改第一个 Plain 组件即可：前缀出现在第一条
+        气泡上，分段回复的切分行为完全不受影响。
+
+        仅对 LLM 结果生效；未选择人格、底层人格待机状态、流式中间结果不加。
+        """
+        if not self.config.get("persona_prefix", False):
+            return
+        try:
+            result = event.get_result()
+            if result is None or not getattr(result, "chain", None):
+                return
+            is_llm = getattr(result, "is_llm_result", None)
+            if callable(is_llm) and not is_llm():
+                return  # 指令/插件文本不加前缀
+
+            umo = event.unified_msg_origin
+            _, _, conv = await self._get_conv(umo)
+            cur_pid = await self._resolve_current_persona_id(
+                umo,
+                getattr(conv, "persona_id", None) if conv else None,
+                event.get_platform_name(),
+            )
+            if not cur_pid:
+                return
+            base = self.base_persona
+            if base and cur_pid == base:
+                return  # 底层人格待机状态（只回复……）不加前缀
+
+            prefix = f"[{cur_pid}]"
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    if isinstance(comp.text, str) and not comp.text.startswith(prefix):
+                        comp.text = prefix + comp.text
+                    return
+            # 结果链里没有文本组件时，插入一个只含前缀的 Plain
+            result.chain.insert(0, Plain(prefix))
+        except Exception:
+            logger.debug("[pp-switch] 人格前缀注入失败", exc_info=True)
 
     # -- 图片生成 ----------------------------------------------------------
 

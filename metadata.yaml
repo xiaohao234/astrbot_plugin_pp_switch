@@ -1,6 +1,6 @@
 name: astrbot_plugin_pp_switch
 desc: 快捷人格切换：发送 pp 查看人格列表图片，发送 pp 序号 一键切换人格（无需@机器人，立即生效且不影响原有记忆）
-version: v1.0.6
+version: v1.0.7
 author: xiaohao234
 repo: https://github.com/xiaohao234/astrbot_plugin_pp_switch
 astrbot_version: ">=4.0.0,<5"

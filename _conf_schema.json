@@ -53,6 +53,11 @@
     "description": "群聊必须 @ 机器人（或使用唤醒前缀/引用唤醒）才能触发 pp，防止多个机器人同时响应同一条消息；私聊与 WebChat 不受影响。触发后由插件直接回复并停止传播，不会把 pp 当作聊天内容发给 LLM",
     "default": false
   },
+  "persona_prefix": {
+    "type": "bool",
+    "description": "在 LLM 回复前附加 [当前人格名] 前缀，如 [音游大神]你好呀。仅对 LLM 回复生效；未选择人格或底层人格待机（只回复……）时不加；在分段回复之前处理，不影响分段功能",
+    "default": false
+  },
   "hidden_personas": {
     "type": "list",
     "description": "不在 pp 列表图片中显示的人格名称（由 pp 隐藏/pp 显示 指令维护，也可在此手动编辑）。注意：隐藏仅影响图片显示，序号保持不变、仍可通过 pp 序号 切换",
