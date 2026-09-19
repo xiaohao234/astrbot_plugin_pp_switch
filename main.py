@@ -1020,6 +1020,7 @@ class PPSwitchPlugin(Star):
             self._persona_reinforce.pop(umo, None)
         elif self.config.get("switch_handoff", True):
             # 接下来几次 LLM 请求临时附加人格强化提示，抵消旧历史里的旧人格语气
+            self._reinforce_prune()
             self._persona_reinforce[umo] = [pid, self._REINFORCE_REQUESTS]
         else:
             self._persona_reinforce.pop(umo, None)
@@ -1037,6 +1038,11 @@ class PPSwitchPlugin(Star):
         if clear_ctx:
             return f"已切换到人格 [{index}] {pid}，上下文已清空（聊天记录不受影响），下一条消息立即生效。"
         return f"已切换到人格 [{index}] {pid}，下一条消息立即生效。"
+
+    def _reinforce_prune(self, max_sessions: int = 512):
+        """强化状态容量保护：仅按会话数有界增长，超限时整体清空（强化是尽力而为的提示，清空无副作用）。"""
+        if len(self._persona_reinforce) >= max_sessions:
+            self._persona_reinforce.clear()
 
     @filter.on_llm_request()
     async def reinforce_persona_on_llm_request(self, event: AstrMessageEvent, req):
